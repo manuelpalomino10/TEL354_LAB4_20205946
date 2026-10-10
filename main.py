@@ -1,8 +1,13 @@
-import yaml
+import asyncio
 import json
+import time
+import uuid
+
+import aiohttp
 import requests
+import yaml
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 
 # ============================================================
@@ -125,6 +130,140 @@ class Course:
 
 
 # ============================================================
+# CONEXIONES Y FLOWS
+# ============================================================
+@dataclass
+class FlowEntry:
+    """
+    Representa una flow entry a instalar en un switch.
+    Contiene el nombre unico (clave en Floodlight) y el payload JSON
+    que se enviara a /wm/staticflowentry/json.
+    """
+    name:    str
+    switch:  str      # DPID del switch
+    payload: dict     # cuerpo JSON de la flow entry
+
+    def to_json(self) -> dict:
+        """Devuelve el payload listo para POST a Floodlight."""
+        return self.payload
+
+
+@dataclass
+class Connection:
+    """
+    Representa una conexion activa entre un alumno y un servidor/servicio.
+    Guarda referencia a todas las flow entries instaladas, para poder
+    borrarlas al eliminar la conexion.
+    """
+    handler:    str          # identificador unico (UUID corto)
+    student:    Student
+    server:     Server
+    service:    Service
+    flows:      List[FlowEntry] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+
+    def __str__(self) -> str:
+        return (f"[{self.handler}] {self.student.name} -> "
+                f"{self.server.name}/{self.service.name} "
+                f"({len(self.flows)} flows)")
+
+
+# ============================================================
+# LOGICA DE AUTORIZACION (Indicacion 4 del enunciado)
+# ============================================================
+def is_authorized(student: Student,
+                  server: Server,
+                  service: Service,
+                  courses: Dict[str, Course]) -> Tuple[bool, str]:
+    """
+    Verifica si un alumno esta autorizado a usar un servicio de un servidor.
+
+    Un alumno esta autorizado si y solo si esta matriculado en algun curso
+    cumpliendo las TRES condiciones:
+      (a) estado = ACTIVE
+      (b) tiene al servidor Y en su lista de servidores
+      (c) tiene al servicio X como parte de los "servicios permitidos" para Y
+
+    Retorna (autorizado, razon). Si autorizado, razon identifica el curso
+    que concede el permiso; si no, explica por que no.
+    """
+    razones_rechazo = []
+
+    for curso in courses.values():
+        # El alumno esta matriculado?
+        if student.mac not in curso.students:
+            continue
+
+        # Curso activo?
+        if not curso.is_active:
+            razones_rechazo.append(
+                f"{curso.code} tiene al alumno pero esta INACTIVE"
+            )
+            continue
+
+        # Curso tiene el servidor?
+        if server.name not in curso.servers:
+            razones_rechazo.append(
+                f"{curso.code} no incluye a {server.name}"
+            )
+            continue
+
+        # Curso permite el servicio en ese servidor?
+        if not curso.allows(server.name, service.name):
+            allowed = sorted(curso.allowed[server.name])
+            razones_rechazo.append(
+                f"{curso.code} permite {allowed} en {server.name} "
+                f"pero no '{service.name}'"
+            )
+            continue
+
+        # Todo cumplido: autorizado
+        return True, f"autorizado via curso {curso.code} ({curso.name})"
+
+    # No encontro ningun curso que lo autorice
+    if not razones_rechazo:
+        return False, (f"{student.name} no esta matriculado en ningun curso "
+                       f"con acceso a {server.name}")
+    return False, "no autorizado: " + "; ".join(razones_rechazo)
+
+
+# ============================================================
+# HELPERS PARA CONSTRUIR FLOW ENTRIES
+# ============================================================
+def _make_flow(name:     str,
+               switch:   str,
+               in_port:  int,
+               out_port: int,
+               eth_src:  str,
+               eth_dst:  str,
+               eth_type: str,          # "0x0806" ARP, "0x0800" IPv4
+               ip_proto: Optional[int] = None,   # 6 TCP, 17 UDP
+               tp_dst:   Optional[int] = None,
+               priority: int = 32768) -> FlowEntry:
+    """
+    Construye una flow entry para el endpoint /wm/staticflowentry/json
+    de Floodlight. Devuelve un FlowEntry con nombre unico y payload JSON.
+    """
+    payload = {
+        "switch":   switch,
+        "name":     name,
+        "cookie":   "0",
+        "priority": str(priority),
+        "in_port":  str(in_port),
+        "active":   "true",
+        "eth_src":  eth_src,
+        "eth_dst":  eth_dst,
+        "eth_type": eth_type,
+        "actions":  f"output={out_port}",
+    }
+    if ip_proto is not None:
+        payload["ip_proto"] = str(ip_proto)
+    if tp_dst is not None:
+        payload["tp_dst"] = str(tp_dst)
+    return FlowEntry(name=name, switch=switch, payload=payload)
+
+
+# ============================================================
 # CARGA DE DATOS DESDE YAML
 # ============================================================
 def load_data(filename: str):
@@ -193,9 +332,13 @@ def load_data(filename: str):
 
 
 # ============================================================
-# Stubs del enunciado (los implementaremos en fases siguientes)
+# CONSUMO DE LA REST API DE FLOODLIGHT
 # ============================================================
-def get_attachment_point(controller_ip, mac):
+def get_attachment_point(controller_ip: str, mac: str):
+    """
+    Consulta /wm/device/ y devuelve (switchDPID, port) donde cuelga el host
+    con la MAC dada. Retorna (None, None) si no se encuentra.
+    """
     endpoint = '/wm/device/'
     url = 'http://' + controller_ip + ':8080' + endpoint
     response = requests.get(url, params={'mac': mac})
@@ -209,24 +352,299 @@ def get_attachment_point(controller_ip, mac):
     return attachment_point["switchDPID"], attachment_point["port"]
 
 
-def get_route(controller_ip, src_mac, dst_mac):
+def get_route(controller_ip: str, src_mac: str, dst_mac: str):
+    """
+    Devuelve la ruta de switches entre dos hosts, consultando
+    /wm/topology/route/{src_dpid}/{src_port}/{dst_dpid}/{dst_port}/json.
+    """
     src_sw_dpid, src_sw_port = get_attachment_point(controller_ip, src_mac)
     dst_sw_dpid, dst_sw_port = get_attachment_point(controller_ip, dst_mac)
-    endpoint = f'/wm/topology/route/{src_sw_dpid}/{src_sw_port}/{dst_sw_dpid}/{dst_sw_port}/json'
+    endpoint = (f'/wm/topology/route/{src_sw_dpid}/{src_sw_port}'
+                f'/{dst_sw_dpid}/{dst_sw_port}/json')
     url = 'http://' + controller_ip + ':8080' + endpoint
     response = requests.get(url)
     return response.json()
 
+# ============================================================
+# BUILD ROUTE + INSERCION/BORRADO ASINCRONO DE FLOWS
+# ============================================================
+STATIC_FLOW_ENDPOINT = "/wm/staticflowpusher/json"
 
-def menu():
-    # TODO: implementar en Fase 2
-    print()
+
+def _flows_for_switch(switch_dpid: str,
+                      in_port:     int,
+                      out_port:    int,
+                      src_mac:     str,
+                      dst_mac:     str,
+                      src_ip:      str,
+                      dst_ip:      str,
+                      ip_proto:    int,
+                      tp_dst:      int,
+                      conn_tag:    str) -> List[FlowEntry]:
+    """
+    Construye los 4 flows (ARP ida/vuelta, L4 ida/vuelta) a instalar en
+    un switch intermedio de la ruta. Cada flow lleva un nombre unico
+    con el conn_tag para poder identificar y borrar la conexion despues.
+    """
+    sw_tag = switch_dpid.replace(":", "")[-6:]   # ultimos 6 hex del DPID
+
+    flows: List[FlowEntry] = []
+
+    # --- L4 ida (cliente -> servidor) ---
+    flows.append(_make_flow(
+        name=f"{conn_tag}-{sw_tag}-l4-fwd",
+        switch=switch_dpid,
+        in_port=in_port, out_port=out_port,
+        eth_src=src_mac, eth_dst=dst_mac,
+        eth_type="0x0800",
+        ip_proto=ip_proto, tp_dst=tp_dst,
+        priority=40000,
+    ))
+
+    # --- L4 vuelta (servidor -> cliente) ---
+    #     Nota: para el reply el tp_SRC es el puerto del servicio;
+    #     Floodlight no exige tp_src aqui, basta match L3+L4 inverso.
+    flows.append(FlowEntry(
+        name=f"{conn_tag}-{sw_tag}-l4-ret",
+        switch=switch_dpid,
+        payload={
+            "switch":   switch_dpid,
+            "name":     f"{conn_tag}-{sw_tag}-l4-ret",
+            "cookie":   "0",
+            "priority": "40000",
+            "in_port":  str(out_port),
+            "active":   "true",
+            "eth_src":  dst_mac,
+            "eth_dst":  src_mac,
+            "eth_type": "0x0800",
+            "ip_proto": str(ip_proto),
+            "tp_src":   str(tp_dst),
+            "actions":  f"output={in_port}",
+        },
+    ))
+
+    # --- ARP ida (match solo por eth_src del cliente) ---
+    flows.append(FlowEntry(
+        name=f"{conn_tag}-{sw_tag}-arp-fwd",
+        switch=switch_dpid,
+        payload={
+            "switch":   switch_dpid,
+            "name":     f"{conn_tag}-{sw_tag}-arp-fwd",
+            "cookie":   "0",
+            "priority": "40000",
+            "in_port":  str(in_port),
+            "active":   "true",
+            "eth_src":  src_mac,
+            "eth_type": "0x0806",
+            "actions":  f"output={out_port}",
+        },
+    ))
+
+    # --- ARP vuelta (match solo por eth_src del servidor) ---
+    flows.append(FlowEntry(
+        name=f"{conn_tag}-{sw_tag}-arp-ret",
+        switch=switch_dpid,
+        payload={
+            "switch":   switch_dpid,
+            "name":     f"{conn_tag}-{sw_tag}-arp-ret",
+            "cookie":   "0",
+            "priority": "40000",
+            "in_port":  str(out_port),
+            "active":   "true",
+            "eth_src":  dst_mac,
+            "eth_type": "0x0806",
+            "actions":  f"output={in_port}",
+        },
+    ))
+
+    return flows
 
 
-def build_route():
-    # TODO: implementar en Fase 5
-    print()
+def _plan_flows_from_route(route_json: list,
+                           src_mac: str, dst_mac: str,
+                           src_ip:  str, dst_ip:  str,
+                           ip_proto: int, tp_dst: int,
+                           conn_tag: str) -> List[FlowEntry]:
+    """
+    Dada la lista cruda que devuelve /wm/topology/route/..., arma la lista
+    completa de FlowEntries a instalar: 4 por cada switch intermedio.
 
+    La ruta llega como lista de hops: [(sw,port_in), (sw,port_out), (sw,port_in), ...].
+    Se consume de a pares.
+    """
+    flows: List[FlowEntry] = []
+
+    # Validar que la ruta este bien formada: longitud par
+    if not route_json or len(route_json) % 2 != 0:
+        raise RuntimeError(
+            f"Ruta vacia o malformada (len={len(route_json)}): {route_json}"
+        )
+
+    # Iterar de dos en dos: (hop_in, hop_out) en el mismo switch
+    for i in range(0, len(route_json), 2):
+        hop_in  = route_json[i]
+        hop_out = route_json[i + 1]
+        if hop_in["switch"] != hop_out["switch"]:
+            raise RuntimeError(
+                f"Hops consecutivos no coinciden en switch: "
+                f"{hop_in['switch']} vs {hop_out['switch']}"
+            )
+        sw      = hop_in["switch"]
+        in_port = hop_in["port"]["portNumber"]
+        out_port= hop_out["port"]["portNumber"]
+
+        flows.extend(_flows_for_switch(
+            switch_dpid=sw,
+            in_port=in_port, out_port=out_port,
+            src_mac=src_mac, dst_mac=dst_mac,
+            src_ip=src_ip,   dst_ip=dst_ip,
+            ip_proto=ip_proto, tp_dst=tp_dst,
+            conn_tag=conn_tag,
+        ))
+
+    return flows
+
+
+async def _post_flow(session: aiohttp.ClientSession,
+                     base_url: str,
+                     flow:     FlowEntry) -> Tuple[str, int]:
+    """POST asincrono de un flow al endpoint de Floodlight."""
+    try:
+        async with session.post(base_url + STATIC_FLOW_ENDPOINT,
+                                json=flow.to_json()) as r:
+            return (flow.name, r.status)
+    except Exception as e:
+        return (flow.name, -1)
+
+
+async def _delete_flow(session: aiohttp.ClientSession,
+                       base_url: str,
+                       flow:     FlowEntry) -> Tuple[str, int]:
+    """DELETE asincrono de un flow (por su 'name')."""
+    try:
+        payload = {"name": flow.name}
+        async with session.delete(base_url + STATIC_FLOW_ENDPOINT,
+                                  json=payload) as r:
+            return (flow.name, r.status)
+    except Exception as e:
+        return (flow.name, -1)
+
+
+async def _install_flows_async(flows: List[FlowEntry],
+                               controller_ip: str) -> List[Tuple[str, int]]:
+    """Instala todos los flows en paralelo via asyncio.gather."""
+    base_url = f"http://{controller_ip}:8080"
+    timeout  = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        tasks = [_post_flow(session, base_url, f) for f in flows]
+        return await asyncio.gather(*tasks)
+
+
+async def _delete_flows_async(flows: List[FlowEntry],
+                              controller_ip: str) -> List[Tuple[str, int]]:
+    """Borra todos los flows en paralelo."""
+    base_url = f"http://{controller_ip}:8080"
+    timeout  = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        tasks = [_delete_flow(session, base_url, f) for f in flows]
+        return await asyncio.gather(*tasks)
+
+
+def build_route(controller_ip: str,
+                student: Student,
+                server:  Server,
+                service: Service,
+                courses: Dict[str, Course]) -> Connection:
+    """
+    Orquesta la creacion de una conexion:
+      1. Valida autorizacion (indicacion 4 del enunciado).
+      2. Obtiene attachment points de cliente y servidor via /wm/device/.
+      3. Pide la ruta a Floodlight via /wm/topology/route/.
+      4. Planea los flows (ARP + L4, ida + vuelta por switch).
+      5. Instala los flows en paralelo via aiohttp.
+      6. Devuelve un objeto Connection con handler unico y la lista de flows.
+
+    Lanza NotAuthorizedError o RuntimeError si algun paso falla.
+    """
+    # 1. Autorizacion
+    ok, reason = is_authorized(student, server, service, courses)
+    if not ok:
+        raise NotAuthorizedError(reason)
+
+    # 2. Attachment points
+    src_dpid, src_port = get_attachment_point(controller_ip, student.mac)
+    if src_dpid is None:
+        raise RuntimeError(f"Floodlight no conoce al cliente {student.mac}. "
+                           f"Genera trafico desde el host para que aprenda.")
+
+    # Para el servidor necesitamos su MAC. La resolvemos tambien via /wm/device/
+    # pero por IP, porque el YAML solo nos da la IP.
+    server_mac = _resolve_mac_by_ip(controller_ip, server.ip)
+    if server_mac is None:
+        raise RuntimeError(f"Floodlight no conoce a {server.name} ({server.ip}). "
+                           f"Genera trafico desde el servidor para que aprenda.")
+
+    dst_dpid, dst_port = get_attachment_point(controller_ip, server_mac)
+    if dst_dpid is None:
+        raise RuntimeError(f"Floodlight tiene a {server.ip} pero sin attachment point.")
+
+    # 3. Ruta
+    endpoint = (f"/wm/topology/route/{src_dpid}/{src_port}"
+                f"/{dst_dpid}/{dst_port}/json")
+    r = requests.get(f"http://{controller_ip}:8080" + endpoint, timeout=5)
+    route = r.json()
+    if not route:
+        raise RuntimeError(f"Floodlight no pudo calcular ruta: {route}")
+
+    # 4. Plan de flows
+    ip_proto = 6 if service.protocol.upper() == "TCP" else 17
+    handler  = uuid.uuid4().hex[:8]           # 8 hex, suficientemente unico
+    conn_tag = f"c-{handler}"
+    flows = _plan_flows_from_route(
+        route_json=route,
+        src_mac=student.mac, dst_mac=server_mac,
+        src_ip="0.0.0.0",   dst_ip="0.0.0.0",  # no se matchean L3 por IP aqui
+        ip_proto=ip_proto, tp_dst=service.port,
+        conn_tag=conn_tag,
+    )
+
+    # 5. Instalar en paralelo
+    results = asyncio.run(_install_flows_async(flows, controller_ip))
+    fallidos = [(n, s) for (n, s) in results if s != 200]
+    if fallidos:
+        # Rollback de los que si se instalaron
+        asyncio.run(_delete_flows_async(flows, controller_ip))
+        raise RuntimeError(f"Fallo la instalacion de flows: {fallidos}")
+
+    # 6. Devolver conexion
+    return Connection(
+        handler=handler, student=student,
+        server=server, service=service,
+        flows=flows,
+    )
+
+
+def delete_route(controller_ip: str, conn: Connection) -> List[Tuple[str, int]]:
+    """
+    Borra todos los flows de una conexion. Devuelve la lista de resultados
+    (nombre, status_http) por cada flow borrado.
+    """
+    return asyncio.run(_delete_flows_async(conn.flows, controller_ip))
+
+
+def _resolve_mac_by_ip(controller_ip: str, ip: str) -> Optional[str]:
+    """
+    Consulta /wm/device/?ipv4=<ip> para resolver la MAC asociada.
+    Devuelve None si Floodlight aun no conoce al host.
+    """
+    url = f"http://{controller_ip}:8080/wm/device/"
+    r   = requests.get(url, params={"ipv4": ip}, timeout=5)
+    devices = r.json()
+    for d in devices:
+        macs = d.get("mac", [])
+        if macs:
+            return macs[0]
+    return None
 
 # ============================================================
 # UTILIDADES DE PRESENTACION
@@ -266,7 +684,6 @@ def menu_cursos(state: dict) -> None:
         op = _prompt("Opcion:")
 
         if op == "1":
-            # --- Crear curso ---
             code  = _prompt("Codigo del curso (ej. HGW104):").upper()
             if code in courses:
                 print(f"[ERROR] Ya existe un curso con codigo {code}")
@@ -306,7 +723,6 @@ def menu_cursos(state: dict) -> None:
                     print(f"    - {sv_name} @ {sv.ip} -> servicios permitidos: {allowed}")
 
         elif op == "4":
-            # --- Actualizar curso ---
             code = _prompt("Codigo del curso a actualizar:").upper()
             curso = courses.get(code)
             if not curso:
@@ -326,7 +742,6 @@ def menu_cursos(state: dict) -> None:
             print(f"[OK] Curso actualizado: {curso}")
 
         elif op == "5":
-            # --- Gestionar alumnos del curso ---
             code = _prompt("Codigo del curso:").upper()
             curso = courses.get(code)
             if not curso:
@@ -369,7 +784,6 @@ def menu_cursos(state: dict) -> None:
                 _pause()
 
         elif op == "6":
-            # --- Borrar curso ---
             code = _prompt("Codigo del curso a borrar:").upper()
             if code not in courses:
                 print(f"[ERROR] No existe el curso {code}")
@@ -382,6 +796,7 @@ def menu_cursos(state: dict) -> None:
         else:
             print("[ERROR] Opcion invalida")
         _pause()
+
 
 # ============================================================
 # SUBMENU: ALUMNOS
@@ -400,7 +815,6 @@ def menu_alumnos(state: dict) -> None:
         op = _prompt("Opcion:")
 
         if op == "1":
-            # --- Crear alumno ---
             name = _prompt("Nombre completo:")
             if not name:
                 print("[ERROR] El nombre no puede estar vacio")
@@ -457,7 +871,6 @@ def menu_alumnos(state: dict) -> None:
                     print(f"    - [{c.code}] {c.name} ({c.state})")
 
         elif op == "4":
-            # --- Actualizar alumno ---
             mac = _prompt("MAC del alumno a actualizar:")
             st = students.get(mac)
             if not st:
@@ -472,13 +885,11 @@ def menu_alumnos(state: dict) -> None:
             print(f"[OK] Alumno actualizado: {st}")
 
         elif op == "5":
-            # --- Borrar alumno ---
             mac = _prompt("MAC del alumno a borrar:")
             if mac not in students:
                 print(f"[ERROR] No existe alumno con MAC {mac}")
                 _pause()
                 continue
-            # Desmatricular de todos los cursos primero
             for c in courses.values():
                 if mac in c.students:
                     c.unenroll(mac)
@@ -490,6 +901,7 @@ def menu_alumnos(state: dict) -> None:
         else:
             print("[ERROR] Opcion invalida")
         _pause()
+
 
 # ============================================================
 # SUBMENU: SERVIDORES
@@ -509,7 +921,7 @@ def menu_servidores(state: dict) -> None:
         op = _prompt("Opcion:")
 
         if op == "1":
-            print("[TODO] Crear servidor (Fase 3)")
+            print("[TODO] Crear servidor")
         elif op == "2":
             _separator("Servidores registrados")
             for sv in servers.values():
@@ -535,11 +947,10 @@ def menu_servidores(state: dict) -> None:
                 if not found:
                     print("    (ninguno)")
         elif op == "4":
-            print("[TODO] Actualizar servidor (Fase 3)")
+            print("[TODO] Actualizar servidor")
         elif op == "5":
-            print("[TODO] Borrar servidor (Fase 3)")
+            print("[TODO] Borrar servidor")
         elif op == "6":
-            # Filtro cursos por acceso a un servicio especifico sobre un servidor
             name = _prompt("Nombre del servidor (ej. Server 3):")
             sv = servers.get(name)
             if not sv:
@@ -563,8 +974,10 @@ def menu_servidores(state: dict) -> None:
         else:
             print("[ERROR] Opcion invalida")
         _pause()
+
+
 # ============================================================
-# SUBMENU: POLITICAS (placeholder - no obligatorio segun rubrica)
+# SUBMENU: POLITICAS
 # ============================================================
 def menu_politicas(state: dict) -> None:
     _separator("POLITICAS")
@@ -578,28 +991,119 @@ def menu_politicas(state: dict) -> None:
 
 
 # ============================================================
-# SUBMENU: CONEXIONES (stub - se implementa en Fase 6)
+# SUBMENU: CONEXIONES
 # ============================================================
 def menu_conexiones(state: dict) -> None:
+    students  = state["students"]
+    servers   = state["servers"]
+    courses   = state["courses"]
+    ctrl_ip   = state["controller_ip"]
+    conns     = state.setdefault("connections", {})   # handler -> Connection
+
     while True:
         _separator("CONEXIONES")
+        print(f"  Activas: {len(conns)}")
         print("  1. Crear")
         print("  2. Listar")
         print("  3. Mostrar detalles")
-        print("  4. Recalcular")
-        print("  5. Actualizar")
-        print("  6. Borrar")
-        print("  7. Volver")
+        print("  4. Borrar")
+        print("  5. Volver")
         op = _prompt("Opcion:")
 
-        if op == "7":
+        # ---------- CREAR ----------
+        if op == "1":
+            mac = _prompt("MAC del alumno:")
+            st  = students.get(mac)
+            if not st:
+                print(f"[ERROR] No existe alumno con MAC {mac}")
+                _pause(); continue
+
+            sv_name = _prompt("Nombre del servidor (ej. Server 3):")
+            sv      = servers.get(sv_name)
+            if not sv:
+                print(f"[ERROR] No existe el servidor '{sv_name}'")
+                _pause(); continue
+
+            svc_name = _prompt(f"Servicio en {sv.name} (ej. ssh):").lower()
+            svc      = sv.get_service(svc_name)
+            if not svc:
+                print(f"[ERROR] {sv.name} no expone '{svc_name}'")
+                _pause(); continue
+
+            print(f"\n[*] Validando autorizacion y construyendo ruta ...")
+            try:
+                conn = build_route(ctrl_ip, st, sv, svc, courses)
+            except NotAuthorizedError as e:
+                print(f"[ACCESO DENEGADO] {e}")
+                _pause(); continue
+            except RuntimeError as e:
+                print(f"[ERROR] {e}")
+                _pause(); continue
+            except Exception as e:
+                print(f"[ERROR inesperado] {type(e).__name__}: {e}")
+                _pause(); continue
+
+            conns[conn.handler] = conn
+            print(f"[OK] Conexion creada con handler = {conn.handler}")
+            print(f"     {conn}")
+            print(f"     Flows instalados: {len(conn.flows)}")
+
+        # ---------- LISTAR ----------
+        elif op == "2":
+            _separator("Conexiones activas")
+            if not conns:
+                print("  (ninguna)")
+            for c in conns.values():
+                print(f"  - {c}")
+
+        # ---------- MOSTRAR DETALLES ----------
+        elif op == "3":
+            handler = _prompt("Handler de la conexion:")
+            c = conns.get(handler)
+            if not c:
+                print(f"[ERROR] No existe conexion con handler '{handler}'")
+            else:
+                _separator(f"Detalle de conexion {handler}")
+                print(f"  Alumno    : {c.student}")
+                print(f"  Servidor  : {c.server}")
+                print(f"  Servicio  : {c.service}")
+                print(f"  Flows ({len(c.flows)}):")
+                # Resumen por switch
+                por_sw: Dict[str, List[str]] = {}
+                for f in c.flows:
+                    por_sw.setdefault(f.switch, []).append(f.name)
+                for sw, nombres in por_sw.items():
+                    print(f"    - {sw}  ({len(nombres)} flows)")
+                    for n in nombres:
+                        print(f"        . {n}")
+
+        # ---------- BORRAR ----------
+        elif op == "4":
+            handler = _prompt("Handler de la conexion a borrar:")
+            c = conns.get(handler)
+            if not c:
+                print(f"[ERROR] No existe conexion con handler '{handler}'")
+                _pause(); continue
+            print(f"[*] Borrando {len(c.flows)} flows ...")
+            try:
+                results = delete_route(ctrl_ip, c)
+                fallidos = [(n, s) for (n, s) in results if s != 200]
+                if fallidos:
+                    print(f"[AVISO] Algunos flows no respondieron 200: {fallidos}")
+                else:
+                    print(f"[OK] Todos los flows ({len(results)}) borrados correctamente")
+                del conns[handler]
+            except Exception as e:
+                print(f"[ERROR] {e}")
+
+        elif op == "5":
             return
-        print(f"[TODO] Opcion {op} de Conexiones (Fase 6: build_route + flows)")
+        else:
+            print("[ERROR] Opcion invalida")
         _pause()
 
-
 # ============================================================
-# IMPORTAR / EXPORTAR (stub - Fase 7)
+# IMPORTAR / EXPORTAR
 # ============================================================
 def importar(state: dict) -> None:
     filename = _prompt("Nombre del archivo YAML a importar:")
@@ -618,7 +1122,7 @@ def importar(state: dict) -> None:
 
 
 def exportar(state: dict) -> None:
-    print("[TODO] Exportar estado a YAML (Fase 7)")
+    print("[TODO] Exportar estado a YAML")
     _pause()
 
 
@@ -626,7 +1130,6 @@ def exportar(state: dict) -> None:
 # MENU PRINCIPAL
 # ============================================================
 def menu():
-    # Carga inicial
     try:
         students, servers, courses = load_data("database.yaml")
     except FileNotFoundError:
@@ -668,11 +1171,12 @@ def menu():
         else:
             print("[ERROR] Opcion invalida")
 
+
 # ============================================================
-# MAIN (temporal: solo verificacion de carga - Fase 1)
+# ENTRYPOINT
 # ============================================================
 def main():
-   menu()
+    menu()
 
 
 if __name__ == "__main__":
